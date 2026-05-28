@@ -12,8 +12,6 @@ export async function callIaeuStream({
   userId,
   userInfo,
   userContext,
-  tools,
-  toolChoice,
   image,
 }) {
   const url = buildStreamUrl(config.endpoint);
@@ -32,13 +30,6 @@ export async function callIaeuStream({
     form.append("user_context", JSON.stringify(userContext));
   }
 
-  if (tools && tools.length > 0) {
-    form.append("tools", JSON.stringify(tools));
-  }
-
-  if (toolChoice) {
-    form.append("tool_choice", JSON.stringify(toolChoice));
-  }
 
   if (image?.buffer) {
     const blob = new Blob([image.buffer], { type: image.mimeType || "application/octet-stream" });

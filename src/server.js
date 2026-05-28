@@ -34,29 +34,6 @@ app.listen({ port: config.port, host: "0.0.0.0" }).catch((error) => {
 async function handleResponsesRequest({ request, reply, config, mode }) {
   const body = request.body || {};
   const { model, input, stream, user, metadata } = body;
-  const toolsCount = Array.isArray(body.tools) ? body.tools.length : 0;
-  const toolChoice = body.tool_choice || body.toolChoice || null;
-  request.log.info(
-    {
-      hasTools: toolsCount > 0,
-      toolsCount,
-      toolChoice,
-    },
-    "copilot tool metadata"
-  );
-  if (toolsCount > 0) {
-    const toolNames = body.tools
-      .map((tool) => tool?.name || tool?.function?.name || tool?.tool?.name)
-      .filter(Boolean)
-      .slice(0, 10);
-    request.log.info(
-      {
-        sampleToolNames: toolNames,
-        firstToolKeys: Object.keys(body.tools[0] || {}),
-      },
-      "copilot tool schema sample"
-    );
-  }
   const { text, image } = extractUserMessage(input);
 
   const conversationKey =
@@ -98,8 +75,6 @@ async function handleResponsesRequest({ request, reply, config, mode }) {
       userId: user || undefined,
       userInfo: { user: user || null },
       userContext,
-      tools: Array.isArray(body.tools) ? body.tools : null,
-      toolChoice,
       image,
     });
   } catch (error) {
