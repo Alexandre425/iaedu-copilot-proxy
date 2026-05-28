@@ -54,15 +54,6 @@ async function handleResponsesRequest({ request, reply, config, mode }) {
   if (metadata && typeof metadata === "object") {
     userContext = { ...userContext, ...metadata };
   }
-  if (toolsCount > 0 || toolChoice) {
-    userContext = {
-      ...userContext,
-      copilot_tools: {
-        tool_choice: toolChoice,
-        tools: Array.isArray(body.tools) ? body.tools : [],
-      },
-    };
-  }
 
   const responseMeta = createResponseMetadata(model);
 
