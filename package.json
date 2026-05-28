@@ -1,0 +1,19 @@
+{
+  "name": "iaedu-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible proxy for IAEdu /stream",
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "fastify": "^4.28.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
