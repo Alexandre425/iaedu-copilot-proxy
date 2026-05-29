@@ -35,6 +35,21 @@ export function createResponsesObject({ responseId, created, model, text }) {
   };
 }
 
+export function createResponsesObjectWithOutput({ responseId, created, model, output }) {
+  return {
+    id: responseId,
+    object: "response",
+    created,
+    model,
+    output,
+    usage: {
+      input_tokens: null,
+      output_tokens: null,
+      total_tokens: null,
+    },
+  };
+}
+
 export function createChatCompletionObject({ responseId, created, model, text }) {
   return {
     id: responseId,
@@ -64,48 +79,238 @@ export function writeSseEvent(res, event, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+const TOOL_CALL_START = "<tool_call>";
+const TOOL_CALL_END = "</tool_call>";
+
+export function createToolCallParser() {
+  return { buffer: "", inToolCall: false };
+}
+
+export function ingestToolCallText(parser, text) {
+  if (!text) {
+    return [];
+  }
+
+  parser.buffer += text;
+  const outputs = [];
+
+  while (parser.buffer.length > 0) {
+    if (!parser.inToolCall) {
+      const startIndex = parser.buffer.indexOf(TOOL_CALL_START);
+      if (startIndex === -1) {
+        const { safeText, remainder } = splitForToolStart(parser.buffer);
+        if (safeText) {
+          outputs.push({ type: "text", text: safeText });
+        }
+        parser.buffer = remainder;
+        break;
+      }
+
+      if (startIndex > 0) {
+        outputs.push({ type: "text", text: parser.buffer.slice(0, startIndex) });
+      }
+
+      parser.buffer = parser.buffer.slice(startIndex + TOOL_CALL_START.length);
+      parser.inToolCall = true;
+      continue;
+    }
+
+    const endIndex = parser.buffer.indexOf(TOOL_CALL_END);
+    if (endIndex === -1) {
+      break;
+    }
+
+    const raw = parser.buffer.slice(0, endIndex);
+    outputs.push({
+      type: "tool_call",
+      raw,
+      toolCall: parseToolCallPayload(raw),
+    });
+
+    parser.buffer = parser.buffer.slice(endIndex + TOOL_CALL_END.length);
+    parser.inToolCall = false;
+  }
+
+  return outputs;
+}
+
+export function finalizeToolCallParser(parser) {
+  const outputs = [];
+  if (parser.inToolCall) {
+    if (parser.buffer) {
+      outputs.push({ type: "text", text: `${TOOL_CALL_START}${parser.buffer}` });
+    }
+    parser.buffer = "";
+    parser.inToolCall = false;
+    return outputs;
+  }
+
+  if (parser.buffer) {
+    outputs.push({ type: "text", text: parser.buffer });
+    parser.buffer = "";
+  }
+
+  return outputs;
+}
+
 export async function pipeIaeuToResponses({ iaeduResponse, res, responseId, created, model }) {
-  let aggregated = "";
   const state = { seenToken: false };
+  const parser = createToolCallParser();
+  const outputItems = [];
+  let messageItem = null;
+  let messageText = "";
+  let messageOutputIndex = null;
   writeSseEvent(res, "response.created", {
     id: responseId,
     object: "response",
     created,
     model,
   });
-  const outputItem = {
-    id: `msg_${responseId}`,
-    type: "message",
-    role: "assistant",
-    content: [
-      {
+
+  const ensureMessageItem = () => {
+    if (messageItem) {
+      return;
+    }
+
+    messageOutputIndex = outputItems.length;
+    messageItem = {
+      id: `msg_${responseId}_${messageOutputIndex}`,
+      type: "message",
+      role: "assistant",
+      content: [
+        {
+          type: "output_text",
+          text: "",
+        },
+      ],
+    };
+    outputItems.push(messageItem);
+
+    writeSseEvent(res, "response.output_item.added", {
+      response_id: responseId,
+      output_index: messageOutputIndex,
+      item: messageItem,
+    });
+    writeSseEvent(res, "response.content_part.added", {
+      response_id: responseId,
+      output_index: messageOutputIndex,
+      content_index: 0,
+      item_id: messageItem.id,
+      part: {
         type: "output_text",
         text: "",
       },
-    ],
+    });
   };
-  writeSseEvent(res, "response.output_item.added", {
-    response_id: responseId,
-    output_index: 0,
-    item: outputItem,
-  });
-  writeSseEvent(res, "response.content_part.added", {
-    response_id: responseId,
-    output_index: 0,
-    content_index: 0,
-    item_id: outputItem.id,
-    part: {
-      type: "output_text",
-      text: "",
-    },
-  });
+
+  const appendTextDelta = (text) => {
+    if (!text) {
+      return;
+    }
+    ensureMessageItem();
+    messageText += text;
+    writeSseEvent(res, "response.output_text.delta", {
+      response_id: responseId,
+      output_index: messageOutputIndex,
+      content_index: 0,
+      item_id: messageItem.id,
+      delta: text,
+    });
+  };
+
+  const finalizeMessageItem = () => {
+    if (!messageItem) {
+      return;
+    }
+
+    messageItem.content[0].text = messageText;
+    writeSseEvent(res, "response.output_text.done", {
+      response_id: responseId,
+      output_index: messageOutputIndex,
+      content_index: 0,
+      text: messageText,
+    });
+    writeSseEvent(res, "response.content_part.done", {
+      response_id: responseId,
+      output_index: messageOutputIndex,
+      content_index: 0,
+      item_id: messageItem.id,
+      part: {
+        type: "output_text",
+        text: messageText,
+      },
+    });
+    writeSseEvent(res, "response.output_item.done", {
+      response_id: responseId,
+      output_index: messageOutputIndex,
+      item: messageItem,
+    });
+
+    messageItem = null;
+    messageText = "";
+    messageOutputIndex = null;
+  };
+
+  const emitToolCall = (segment) => {
+    finalizeMessageItem();
+
+    if (!segment?.toolCall?.name) {
+      const fallbackText = `${TOOL_CALL_START}${segment?.raw ?? ""}${TOOL_CALL_END}`;
+      appendTextDelta(fallbackText);
+      return;
+    }
+
+    const outputIndex = outputItems.length;
+    const itemId = `fc_${responseId}_${outputIndex}`;
+    const callId = `call_${randomUUID()}`;
+    const argumentsJson = serializeToolArguments(segment.toolCall.arguments);
+    const item = {
+      id: itemId,
+      type: "function_call",
+      call_id: callId,
+      name: segment.toolCall.name,
+      arguments: "",
+    };
+
+    outputItems.push(item);
+    writeSseEvent(res, "response.output_item.added", {
+      response_id: responseId,
+      output_index: outputIndex,
+      item,
+    });
+    writeSseEvent(res, "response.function_call_arguments.delta", {
+      response_id: responseId,
+      output_index: outputIndex,
+      item_id: itemId,
+      delta: argumentsJson,
+    });
+    writeSseEvent(res, "response.function_call_arguments.done", {
+      response_id: responseId,
+      output_index: outputIndex,
+      item_id: itemId,
+      arguments: argumentsJson,
+    });
+
+    item.arguments = argumentsJson;
+    writeSseEvent(res, "response.output_item.done", {
+      response_id: responseId,
+      output_index: outputIndex,
+      item,
+    });
+  };
 
   const reader = iaeduResponse.body?.getReader?.();
   let buffer = "";
 
   if (!reader) {
     const text = await iaeduResponse.text();
-    aggregated = text;
+    for (const segment of ingestToolCallText(parser, text)) {
+      if (segment.type === "text") {
+        appendTextDelta(segment.text);
+      } else {
+        emitToolCall(segment);
+      }
+    }
   } else {
     while (true) {
       const { done, value } = await reader.read();
@@ -123,14 +328,13 @@ export async function pipeIaeuToResponses({ iaeduResponse, res, responseId, crea
           continue;
         }
         if (delta.text) {
-          aggregated += delta.text;
-          writeSseEvent(res, "response.output_text.delta", {
-            response_id: responseId,
-            output_index: 0,
-            content_index: 0,
-            item_id: outputItem.id,
-            delta: delta.text,
-          });
+          for (const segment of ingestToolCallText(parser, delta.text)) {
+            if (segment.type === "text") {
+              appendTextDelta(segment.text);
+            } else {
+              emitToolCall(segment);
+            }
+          }
         }
       }
     }
@@ -138,48 +342,31 @@ export async function pipeIaeuToResponses({ iaeduResponse, res, responseId, crea
     if (buffer.trim()) {
       const delta = extractDeltaFromChunk(buffer, state);
       if (delta.text) {
-        aggregated += delta.text;
-        writeSseEvent(res, "response.output_text.delta", {
-          response_id: responseId,
-          output_index: 0,
-          content_index: 0,
-          item_id: outputItem.id,
-          delta: delta.text,
-        });
+        for (const segment of ingestToolCallText(parser, delta.text)) {
+          if (segment.type === "text") {
+            appendTextDelta(segment.text);
+          } else {
+            emitToolCall(segment);
+          }
+        }
       }
     }
   }
 
-  outputItem.content[0].text = aggregated;
-  writeSseEvent(res, "response.output_text.done", {
-    response_id: responseId,
-    output_index: 0,
-    content_index: 0,
-    text: aggregated,
-  });
-  writeSseEvent(res, "response.content_part.done", {
-    response_id: responseId,
-    output_index: 0,
-    content_index: 0,
-    item_id: outputItem.id,
-    part: {
-      type: "output_text",
-      text: aggregated,
-    },
-  });
-  writeSseEvent(res, "response.output_item.done", {
-    response_id: responseId,
-    output_index: 0,
-    item: outputItem,
-  });
+  for (const segment of finalizeToolCallParser(parser)) {
+    if (segment.type === "text") {
+      appendTextDelta(segment.text);
+    }
+  }
 
-  const responseObject = createResponsesObject({
+  finalizeMessageItem();
+
+  const responseObject = createResponsesObjectWithOutput({
     responseId,
     created,
     model,
-    text: aggregated,
+    output: outputItems,
   });
-  responseObject.output[0] = outputItem;
   writeSseEvent(res, "response.completed", {
     ...responseObject,
     response: responseObject,
@@ -222,6 +409,131 @@ export async function collectIaeuText(iaeduResponse) {
   }
 
   return aggregated;
+}
+
+export async function collectIaeuOutput(iaeduResponse) {
+  const reader = iaeduResponse.body?.getReader?.();
+  let buffer = "";
+  const state = { seenToken: false };
+  const parser = createToolCallParser();
+  const outputItems = [];
+  let messageItem = null;
+  let messageText = "";
+
+  const appendText = (text) => {
+    if (!text) {
+      return;
+    }
+
+    if (!messageItem) {
+      messageItem = {
+        id: `msg_${randomUUID()}`,
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: "",
+          },
+        ],
+      };
+      outputItems.push(messageItem);
+    }
+
+    messageText += text;
+    messageItem.content[0].text = messageText;
+  };
+
+  const finalizeMessage = () => {
+    if (!messageItem) {
+      return;
+    }
+    messageItem.content[0].text = messageText;
+    messageItem = null;
+    messageText = "";
+  };
+
+  const emitToolCallItem = (segment) => {
+    finalizeMessage();
+
+    if (!segment?.toolCall?.name) {
+      const fallbackText = `${TOOL_CALL_START}${segment?.raw ?? ""}${TOOL_CALL_END}`;
+      appendText(fallbackText);
+      return;
+    }
+
+    const argumentsJson = serializeToolArguments(segment.toolCall.arguments);
+    outputItems.push({
+      id: `fc_${randomUUID()}`,
+      type: "function_call",
+      call_id: `call_${randomUUID()}`,
+      name: segment.toolCall.name,
+      arguments: argumentsJson,
+    });
+  };
+
+  if (!reader) {
+    const text = await iaeduResponse.text();
+    for (const segment of ingestToolCallText(parser, text)) {
+      if (segment.type === "text") {
+        appendText(segment.text);
+      } else {
+        emitToolCallItem(segment);
+      }
+    }
+  } else {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += new TextDecoder().decode(value, { stream: true });
+      const { events, remainder } = parseStreamBuffer(buffer);
+      buffer = remainder;
+
+      for (const eventText of events) {
+        const delta = extractDeltaFromChunk(eventText, state);
+        if (!delta.done && delta.text) {
+          for (const segment of ingestToolCallText(parser, delta.text)) {
+            if (segment.type === "text") {
+              appendText(segment.text);
+            } else {
+              emitToolCallItem(segment);
+            }
+          }
+        }
+      }
+    }
+
+    if (buffer.trim()) {
+      const delta = extractDeltaFromChunk(buffer, state);
+      if (delta.text) {
+        for (const segment of ingestToolCallText(parser, delta.text)) {
+          if (segment.type === "text") {
+            appendText(segment.text);
+          } else {
+            emitToolCallItem(segment);
+          }
+        }
+      }
+    }
+  }
+
+  for (const segment of finalizeToolCallParser(parser)) {
+    if (segment.type === "text") {
+      appendText(segment.text);
+    }
+  }
+
+  finalizeMessage();
+
+  const combinedText = outputItems
+    .filter((item) => item.type === "message")
+    .map((item) => item.content?.[0]?.text || "")
+    .join("");
+
+  return { output: outputItems, text: combinedText };
 }
 
 export function splitSseEvents(buffer) {
@@ -401,5 +713,72 @@ function safeJsonParse(value) {
     return JSON.parse(value);
   } catch (error) {
     return null;
+  }
+}
+
+function parseToolCallPayload(raw) {
+  const parsed = safeJsonParse(raw.trim());
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  const name =
+    typeof parsed.name === "string"
+      ? parsed.name
+      : typeof parsed.tool_name === "string"
+        ? parsed.tool_name
+        : typeof parsed.toolName === "string"
+          ? parsed.toolName
+          : "";
+
+  const argumentsValue =
+    "arguments" in parsed
+      ? parsed.arguments
+      : "args" in parsed
+        ? parsed.args
+        : parsed.arguments;
+
+  if (!name) {
+    return null;
+  }
+
+  return { name, arguments: argumentsValue };
+}
+
+function splitForToolStart(text) {
+  const keepLength = longestSuffixPrefix(text, TOOL_CALL_START);
+  if (keepLength === 0) {
+    return { safeText: text, remainder: "" };
+  }
+
+  return {
+    safeText: text.slice(0, text.length - keepLength),
+    remainder: text.slice(text.length - keepLength),
+  };
+}
+
+function longestSuffixPrefix(text, marker) {
+  const maxLength = Math.min(text.length, marker.length - 1);
+  for (let i = maxLength; i > 0; i -= 1) {
+    if (marker.startsWith(text.slice(-i))) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+function serializeToolArguments(argumentsValue) {
+  if (argumentsValue == null) {
+    return "{}";
+  }
+
+  if (typeof argumentsValue === "string") {
+    return argumentsValue;
+  }
+
+  try {
+    return JSON.stringify(argumentsValue);
+  } catch (error) {
+    return "{}";
   }
 }

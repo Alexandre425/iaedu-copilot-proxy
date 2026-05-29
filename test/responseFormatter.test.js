@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  createToolCallParser,
   extractDeltaFromEvent,
+  finalizeToolCallParser,
+  ingestToolCallText,
   splitJsonObjects,
   splitSseEvents,
 } from "../src/responseFormatter.js";
@@ -47,4 +50,34 @@ test("splitJsonObjects handles concatenated objects", () => {
   assert.equal(result.events[0].content, "Hi");
   assert.equal(result.events[1].content, "!");
   assert.equal(result.remainder, "");
+});
+
+test("tool call parser yields text and tool call segments", () => {
+  const parser = createToolCallParser();
+  const outputs = ingestToolCallText(
+    parser,
+    'Hello <tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call> done'
+  );
+
+  assert.equal(outputs.length, 3);
+  assert.equal(outputs[0].type, "text");
+  assert.equal(outputs[1].type, "tool_call");
+  assert.equal(outputs[1].toolCall.name, "read_file");
+  assert.equal(outputs[2].type, "text");
+});
+
+test("tool call parser handles partial markers", () => {
+  const parser = createToolCallParser();
+  const first = ingestToolCallText(parser, "Hello <tool_");
+  const second = ingestToolCallText(
+    parser,
+    'call>{"name":"echo","arguments":{}}</tool_call>'
+  );
+  const final = finalizeToolCallParser(parser);
+
+  assert.equal(first.length, 1);
+  assert.equal(first[0].type, "text");
+  assert.equal(second.length, 1);
+  assert.equal(second[0].type, "tool_call");
+  assert.equal(final.length, 0);
 });

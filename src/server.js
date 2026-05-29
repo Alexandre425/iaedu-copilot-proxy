@@ -2,14 +2,16 @@ import "dotenv/config";
 import Fastify from "fastify";
 import { loadConfig } from "./config.js";
 import { getThreadIdForKey } from "./threadStore.js";
-import { extractUserMessage } from "./openaiMapper.js";
+import { buildMessageWithTools, extractTooling, extractUserMessage } from "./openaiMapper.js";
 import { callIaeuStream } from "./iaeduClient.js";
 import { mapIaeuError } from "./errors.js";
 import {
   collectIaeuText,
+  collectIaeuOutput,
   createChatCompletionObject,
   createResponseMetadata,
   createResponsesObject,
+  createResponsesObjectWithOutput,
   pipeIaeuToResponses,
 } from "./responseFormatter.js";
 
@@ -33,8 +35,15 @@ app.listen({ port: config.port, host: "0.0.0.0" }).catch((error) => {
 
 async function handleResponsesRequest({ request, reply, config, mode }) {
   const body = request.body || {};
-  const { model, input, stream, user, metadata } = body;
+  const { model, input, stream, user, metadata, tools } = body;
   const { text, image } = extractUserMessage(input);
+  const useToolTranslation = mode === "responses";
+  const { tools: toolDefs, toolResults } = useToolTranslation
+    ? extractTooling({ input, tools })
+    : { tools: [], toolResults: [] };
+  const message = useToolTranslation
+    ? buildMessageWithTools({ userText: text, tools: toolDefs, toolResults })
+    : text;
 
   const conversationKey =
     metadata?.conversation_id ||
@@ -61,7 +70,7 @@ async function handleResponsesRequest({ request, reply, config, mode }) {
   try {
     iaeduResponse = await callIaeuStream({
       config,
-      message: text,
+      message,
       threadId,
       userId: user || undefined,
       userInfo: { user: user || null },
@@ -111,9 +120,8 @@ async function handleResponsesRequest({ request, reply, config, mode }) {
     return reply;
   }
 
-  const textResponse = await collectIaeuText(iaeduResponse);
-
   if (mode === "chat") {
+    const textResponse = await collectIaeuText(iaeduResponse);
     const chatResponse = createChatCompletionObject({
       responseId: responseMeta.id,
       created: responseMeta.created,
@@ -123,11 +131,22 @@ async function handleResponsesRequest({ request, reply, config, mode }) {
     return reply.send(chatResponse);
   }
 
-  const responsesObject = createResponsesObject({
+  const { output, text: outputText } = await collectIaeuOutput(iaeduResponse);
+  if (!output || output.length === 0) {
+    const responsesObject = createResponsesObject({
+      responseId: responseMeta.id,
+      created: responseMeta.created,
+      model: responseMeta.model,
+      text: outputText || "",
+    });
+    return reply.send(responsesObject);
+  }
+
+  const responsesObject = createResponsesObjectWithOutput({
     responseId: responseMeta.id,
     created: responseMeta.created,
     model: responseMeta.model,
-    text: textResponse,
+    output,
   });
 
   return reply.send(responsesObject);
