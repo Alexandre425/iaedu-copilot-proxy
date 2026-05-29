@@ -81,3 +81,26 @@ test("tool call parser handles partial markers", () => {
   assert.equal(second[0].type, "tool_call");
   assert.equal(final.length, 0);
 });
+
+test("tool call parser reports malformed json", () => {
+  const parser = createToolCallParser();
+  const outputs = ingestToolCallText(parser, "<tool_call>not json</tool_call>");
+
+  assert.equal(outputs.length, 1);
+  assert.equal(outputs[0].type, "tool_call");
+  assert.equal(outputs[0].toolCall, null);
+  assert.equal(outputs[0].error, "malformed json");
+});
+
+test("tool call parser recovers extra trailing brace", () => {
+  const parser = createToolCallParser();
+  const outputs = ingestToolCallText(
+    parser,
+    '<tool_call>{"name":"list_dir","arguments":{"path":"/tmp"}}}</tool_call>'
+  );
+
+  assert.equal(outputs.length, 1);
+  assert.equal(outputs[0].type, "tool_call");
+  assert.equal(outputs[0].toolCall.name, "list_dir");
+  assert.equal(outputs[0].error, null);
+});

@@ -5,6 +5,7 @@ import { getThreadIdForKey } from "./threadStore.js";
 import { buildMessageWithTools, extractTooling, extractUserMessage } from "./openaiMapper.js";
 import { callIaeuStream } from "./iaeduClient.js";
 import { mapIaeuError } from "./errors.js";
+import { addToolFailure, consumeToolFailures } from "./toolFailureStore.js";
 import {
   collectIaeuText,
   collectIaeuOutput,
@@ -37,13 +38,6 @@ async function handleResponsesRequest({ request, reply, config, mode }) {
   const body = request.body || {};
   const { model, input, stream, user, metadata, tools } = body;
   const { text, image } = extractUserMessage(input);
-  const useToolTranslation = mode === "responses";
-  const { tools: toolDefs, toolResults } = useToolTranslation
-    ? extractTooling({ input, tools })
-    : { tools: [], toolResults: [] };
-  const message = useToolTranslation
-    ? buildMessageWithTools({ userText: text, tools: toolDefs, toolResults })
-    : text;
 
   const conversationKey =
     metadata?.conversation_id ||
@@ -52,6 +46,27 @@ async function handleResponsesRequest({ request, reply, config, mode }) {
     body.conversation ||
     user ||
     request.ip;
+
+  const useToolTranslation = mode === "responses";
+  const { tools: toolDefs, toolResults } = useToolTranslation
+    ? extractTooling({ input, tools })
+    : { tools: [], toolResults: [] };
+  const pendingFailures = useToolTranslation
+    ? consumeToolFailures(conversationKey)
+    : [];
+  const mergedToolResults = pendingFailures.length
+    ? [...pendingFailures, ...toolResults]
+    : toolResults;
+  const onToolCallError = useToolTranslation
+    ? (reason) => addToolFailure(conversationKey, reason)
+    : undefined;
+  const message = useToolTranslation
+    ? buildMessageWithTools({
+        userText: text,
+        tools: toolDefs,
+        toolResults: mergedToolResults,
+      })
+    : text;
 
   const threadId = getThreadIdForKey(conversationKey, config.defaultThreadId);
 
@@ -114,6 +129,7 @@ async function handleResponsesRequest({ request, reply, config, mode }) {
       responseId: responseMeta.id,
       created: responseMeta.created,
       model: responseMeta.model,
+      onToolCallError,
     });
 
     reply.raw.end();
@@ -131,7 +147,9 @@ async function handleResponsesRequest({ request, reply, config, mode }) {
     return reply.send(chatResponse);
   }
 
-  const { output, text: outputText } = await collectIaeuOutput(iaeduResponse);
+  const { output, text: outputText } = await collectIaeuOutput(iaeduResponse, {
+    onToolCallError,
+  });
   if (!output || output.length === 0) {
     const responsesObject = createResponsesObject({
       responseId: responseMeta.id,

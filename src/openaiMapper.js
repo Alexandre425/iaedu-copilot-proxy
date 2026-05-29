@@ -34,11 +34,46 @@ export function buildMessageWithTools({ userText, tools, toolResults }) {
 
   const resultsSection = formatToolResults(toolResults);
 
-  return `You are a coding assistant with proxy-mediated tool access. When you need to call a tool, respond with ONLY this format (no other text before or after):\n<tool_call>{"name":"tool_name","arguments":{...}}</tool_call>\n\nAvailable tools:\n<tools>\n${toolDefs}\n</tools>${resultsSection}\nUser: ${safeText}`.trim();
+  return `You are a coding assistant with proxy-mediated tool access.
+
+The tools listed in the <tools> block are executable in this environment. They are intentionally provided through this prompt, not a native tools field. The proxy will intercept ALL <tool_call> blocks, execute them, and return results inside <tool_results>.
+
+When you need to use a tool, emit a <tool_call> block with valid JSON. You may include normal text before and/or after tool calls, and you may emit multiple tool calls in the same message. Each tool call must be in its own <tool_call>...</tool_call> block:
+<tool_call>{"name":"tool_name","arguments":{...}}</tool_call>
+
+The JSON inside <tool_call> must be valid JSON:
+- use double quotes for keys and string values
+- include all required arguments from the tool schema
+- no comments and no trailing commas
+
+The tool call results will be returned when you finish your message, inside a <tool_results> block. If a tool call is malformed, you will receive a tool result describing the failure.
+
+Do not claim you cannot use tools because they are prompt-described. In this environment, emitting <tool_call> blocks is the correct way to run tools. Do not include a call ID; the proxy will assign one.
+
+Only call tools when useful for the user request. You may explain what you are doing in plain text, then include tool calls as needed.
+
+After receiving <tool_results>, treat them as authoritative and continue. If you need another tool, call it in a new tool call.
+
+Example (search for JS files):
+User: Find JS files in the workspace.
+Assistant:
+<tool_call>{"name":"file_search","arguments":{"query":"**/*.js"}}</tool_call>
+
+Example (text + tool call in same message):
+User: Read the config file and summarize it.
+Assistant:
+I will read the config file, then summarize it.
+<tool_call>{"name":"read_file","arguments":{"filePath":"src/config.js","startLine":1,"endLine":200}}</tool_call>
+
+Available tools:
+<tools>
+${toolDefs}
+</tools>${resultsSection}
+User: ${safeText}`.trim();
 }
 
-const TOOL_LIST_LIMIT = 12;
-const TOOL_RESULT_LIMIT = 4000;
+const TOOL_LIST_LIMIT = 200;
+const TOOL_RESULT_LIMIT = 10000;
 
 function normalizeInputToMessages(input) {
   if (!input) {

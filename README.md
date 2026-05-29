@@ -1,16 +1,25 @@
 # IAEdu Proxy
 
-OpenAI-compatible proxy for the IAEdu multipart `/stream` endpoint. This exposes `POST /v1/responses` and optionally `POST /v1/chat/completions`. Tool calls are not supported by the upstream API.
+OpenAI-compatible proxy for the IAEdu multipart `/stream` endpoint. This exposes `POST /v1/responses` and optionally `POST /v1/chat/completions`.
 
-## What allows you to do
+## What it allows you to do
 
 - Use IAEdu models (GPT-5.5, Opus 4.7, etc.) in VSCode Copilot Chat
-- Ask general questions
+- Ask general questions and request code edits, searches, file reads, and other tool-based actions
 - Include context in the attachments (e.g. code, terminal output, problems, git history, etc.)
+- Proxy-mediated tool calls: the proxy injects available tools into the model's prompt and translates tool calls back to the OpenAI Responses API
 
-## What it doesn't do
+## Tool calls (experimental)
 
-- Tool calls (e.g. code edits, terminal commands, repo search, etc.)
+Tool calls are now supported via **prompt-injection translation**. The proxy:
+1. Injects tool definitions into the system message sent to IAEdu
+2. Instructs the model to emit tool calls in the response
+3. Parses these blocks from the response stream and converts them to OpenAI function_call items
+4. Forwards tool call results and reports malformed tool calls back to the model
+
+**Caveats:**
+- Tool call reliability depends on whether the upstream IAEdu model follows the tool-use instructions. If the model is not fine-tuned for structured output, calls may be malformed or absent.
+- This approach is **experimental** and subject to change as we learn its limits.
 
 ## Setup
 
@@ -34,7 +43,7 @@ The server listens on `http://localhost:3000` by default.
 
 Model Picker > Settings > Add Models... > Custom Endpoint
 
-Pick any name, you don't need to put the API key in (it's in the `.env` file), and pick the "Responses" API. A window will open with a JSON config like the following. Fill in the `id` and pick an appropriate model `name`, based on the API info in the IAEdu UI. 
+Pick any name, you don't need to put the API key in (it's in the `.env` file), and pick the "Responses" API. A window will open with a JSON config like the following. Fill in the `id` and pick an appropriate model `name`, based on the API info in the IAEdu UI.
 
 ```jsonc
 {

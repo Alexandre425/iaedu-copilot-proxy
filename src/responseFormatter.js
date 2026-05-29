@@ -121,10 +121,12 @@ export function ingestToolCallText(parser, text) {
     }
 
     const raw = parser.buffer.slice(0, endIndex);
+    const { toolCall, error } = parseToolCallPayload(raw);
     outputs.push({
       type: "tool_call",
       raw,
-      toolCall: parseToolCallPayload(raw),
+      toolCall,
+      error,
     });
 
     parser.buffer = parser.buffer.slice(endIndex + TOOL_CALL_END.length);
@@ -137,9 +139,10 @@ export function ingestToolCallText(parser, text) {
 export function finalizeToolCallParser(parser) {
   const outputs = [];
   if (parser.inToolCall) {
-    if (parser.buffer) {
-      outputs.push({ type: "text", text: `${TOOL_CALL_START}${parser.buffer}` });
-    }
+    outputs.push({
+      type: "tool_call_error",
+      reason: "unterminated tool_call block",
+    });
     parser.buffer = "";
     parser.inToolCall = false;
     return outputs;
@@ -153,7 +156,14 @@ export function finalizeToolCallParser(parser) {
   return outputs;
 }
 
-export async function pipeIaeuToResponses({ iaeduResponse, res, responseId, created, model }) {
+export async function pipeIaeuToResponses({
+  iaeduResponse,
+  res,
+  responseId,
+  created,
+  model,
+  onToolCallError,
+}) {
   const state = { seenToken: false };
   const parser = createToolCallParser();
   const outputItems = [];
@@ -252,13 +262,12 @@ export async function pipeIaeuToResponses({ iaeduResponse, res, responseId, crea
   };
 
   const emitToolCall = (segment) => {
-    finalizeMessageItem();
-
     if (!segment?.toolCall?.name) {
-      const fallbackText = `${TOOL_CALL_START}${segment?.raw ?? ""}${TOOL_CALL_END}`;
-      appendTextDelta(fallbackText);
+      recordToolCallError(onToolCallError, segment?.error);
       return;
     }
+
+    finalizeMessageItem();
 
     const outputIndex = outputItems.length;
     const itemId = `fc_${responseId}_${outputIndex}`;
@@ -307,6 +316,8 @@ export async function pipeIaeuToResponses({ iaeduResponse, res, responseId, crea
     for (const segment of ingestToolCallText(parser, text)) {
       if (segment.type === "text") {
         appendTextDelta(segment.text);
+      } else if (segment.type === "tool_call_error") {
+        recordToolCallError(onToolCallError, segment.reason);
       } else {
         emitToolCall(segment);
       }
@@ -331,6 +342,8 @@ export async function pipeIaeuToResponses({ iaeduResponse, res, responseId, crea
           for (const segment of ingestToolCallText(parser, delta.text)) {
             if (segment.type === "text") {
               appendTextDelta(segment.text);
+            } else if (segment.type === "tool_call_error") {
+              recordToolCallError(onToolCallError, segment.reason);
             } else {
               emitToolCall(segment);
             }
@@ -345,6 +358,8 @@ export async function pipeIaeuToResponses({ iaeduResponse, res, responseId, crea
         for (const segment of ingestToolCallText(parser, delta.text)) {
           if (segment.type === "text") {
             appendTextDelta(segment.text);
+          } else if (segment.type === "tool_call_error") {
+            recordToolCallError(onToolCallError, segment.reason);
           } else {
             emitToolCall(segment);
           }
@@ -356,6 +371,8 @@ export async function pipeIaeuToResponses({ iaeduResponse, res, responseId, crea
   for (const segment of finalizeToolCallParser(parser)) {
     if (segment.type === "text") {
       appendTextDelta(segment.text);
+    } else if (segment.type === "tool_call_error") {
+      recordToolCallError(onToolCallError, segment.reason);
     }
   }
 
@@ -411,7 +428,7 @@ export async function collectIaeuText(iaeduResponse) {
   return aggregated;
 }
 
-export async function collectIaeuOutput(iaeduResponse) {
+export async function collectIaeuOutput(iaeduResponse, { onToolCallError } = {}) {
   const reader = iaeduResponse.body?.getReader?.();
   let buffer = "";
   const state = { seenToken: false };
@@ -454,13 +471,12 @@ export async function collectIaeuOutput(iaeduResponse) {
   };
 
   const emitToolCallItem = (segment) => {
-    finalizeMessage();
-
     if (!segment?.toolCall?.name) {
-      const fallbackText = `${TOOL_CALL_START}${segment?.raw ?? ""}${TOOL_CALL_END}`;
-      appendText(fallbackText);
+      recordToolCallError(onToolCallError, segment?.error);
       return;
     }
+
+    finalizeMessage();
 
     const argumentsJson = serializeToolArguments(segment.toolCall.arguments);
     outputItems.push({
@@ -477,6 +493,8 @@ export async function collectIaeuOutput(iaeduResponse) {
     for (const segment of ingestToolCallText(parser, text)) {
       if (segment.type === "text") {
         appendText(segment.text);
+      } else if (segment.type === "tool_call_error") {
+        recordToolCallError(onToolCallError, segment.reason);
       } else {
         emitToolCallItem(segment);
       }
@@ -498,6 +516,8 @@ export async function collectIaeuOutput(iaeduResponse) {
           for (const segment of ingestToolCallText(parser, delta.text)) {
             if (segment.type === "text") {
               appendText(segment.text);
+            } else if (segment.type === "tool_call_error") {
+              recordToolCallError(onToolCallError, segment.reason);
             } else {
               emitToolCallItem(segment);
             }
@@ -512,6 +532,8 @@ export async function collectIaeuOutput(iaeduResponse) {
         for (const segment of ingestToolCallText(parser, delta.text)) {
           if (segment.type === "text") {
             appendText(segment.text);
+          } else if (segment.type === "tool_call_error") {
+            recordToolCallError(onToolCallError, segment.reason);
           } else {
             emitToolCallItem(segment);
           }
@@ -523,6 +545,8 @@ export async function collectIaeuOutput(iaeduResponse) {
   for (const segment of finalizeToolCallParser(parser)) {
     if (segment.type === "text") {
       appendText(segment.text);
+    } else if (segment.type === "tool_call_error") {
+      recordToolCallError(onToolCallError, segment.reason);
     }
   }
 
@@ -717,9 +741,15 @@ function safeJsonParse(value) {
 }
 
 function parseToolCallPayload(raw) {
-  const parsed = safeJsonParse(raw.trim());
+  const trimmed = raw.trim();
+  let parsed = safeJsonParse(trimmed);
+
   if (!parsed || typeof parsed !== "object") {
-    return null;
+    parsed = recoverToolCallJson(trimmed);
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    return { toolCall: null, error: "malformed json" };
   }
 
   const name =
@@ -731,6 +761,10 @@ function parseToolCallPayload(raw) {
           ? parsed.toolName
           : "";
 
+  if (!name) {
+    return { toolCall: null, error: "missing tool name" };
+  }
+
   const argumentsValue =
     "arguments" in parsed
       ? parsed.arguments
@@ -738,11 +772,7 @@ function parseToolCallPayload(raw) {
         ? parsed.args
         : parsed.arguments;
 
-  if (!name) {
-    return null;
-  }
-
-  return { name, arguments: argumentsValue };
+  return { toolCall: { name, arguments: argumentsValue }, error: null };
 }
 
 function splitForToolStart(text) {
@@ -781,4 +811,25 @@ function serializeToolArguments(argumentsValue) {
   } catch (error) {
     return "{}";
   }
+}
+
+function recoverToolCallJson(raw) {
+  const { events } = splitJsonObjects(raw);
+  for (const event of events) {
+    if (event && typeof event === "object") {
+      return event;
+    }
+  }
+  return null;
+}
+
+function recordToolCallError(handler, reason) {
+  if (typeof handler !== "function") {
+    return;
+  }
+
+  const message = typeof reason === "string" && reason.trim()
+    ? reason.trim()
+    : "malformed json";
+  handler(message);
 }
